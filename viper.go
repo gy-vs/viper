@@ -143,6 +143,29 @@ type Viper struct {
 
 	onConfigChange func(fsnotify.Event)
 
+	// configMu guards the config map field. Read paths fetch the map with
+	// loadConfig (read lock); transactional reloads publish a fresh map with
+	// storeConfig (write lock). A published map is never mutated in place, so
+	// readers may traverse the snapshot they fetched without holding the lock.
+	configMu sync.RWMutex
+
+	// hooksMu guards the change/reload callbacks and the validator list.
+	hooksMu sync.RWMutex
+
+	// transactionalReload enables atomic, validated hot reloads in WatchConfig.
+	// It is opt-in: when false (the default), WatchConfig keeps its historical
+	// behavior.
+	transactionalReload bool
+
+	// configValidators are run against the isolated candidate configuration
+	// before a transactional reload is published.
+	configValidators []ConfigValidator
+
+	// onReloadError is called when a transactional reload fails to read or
+	// validate the candidate configuration. It receives the error and the path
+	// of the configuration file that triggered the reload.
+	onReloadError func(err error, file string)
+
 	logger *slog.Logger
 
 	encoderRegistry EncoderRegistry
@@ -268,17 +291,61 @@ func Reset() {
 var SupportedExts = []string{"json", "toml", "yaml", "yml", "properties", "props", "prop", "hcl", "tfvars", "dotenv", "env", "ini"}
 
 // OnConfigChange sets the event handler that is called when a config file changes.
+//
+// In transactional reload mode (see [TransactionalReload]), the handler is only
+// invoked after a changed configuration has been read, validated and published
+// successfully.
 func OnConfigChange(run func(in fsnotify.Event)) { v.OnConfigChange(run) }
 
 // OnConfigChange sets the event handler that is called when a config file changes.
 func (v *Viper) OnConfigChange(run func(in fsnotify.Event)) {
+	v.hooksMu.Lock()
+	defer v.hooksMu.Unlock()
+
 	v.onConfigChange = run
+}
+
+// loadConfig returns the active config map. The returned map must be treated as
+// read-only: it is never mutated after publication, so callers may traverse the
+// snapshot they received without holding any lock. Transactional reloads always
+// publish a brand new map, which is why a stale snapshot stays consistent.
+func (v *Viper) loadConfig() map[string]any {
+	v.configMu.RLock()
+	c := v.config
+	v.configMu.RUnlock()
+	return c
+}
+
+// storeConfig atomically replaces the active config map.
+func (v *Viper) storeConfig(c map[string]any) {
+	v.configMu.Lock()
+	v.config = c
+	v.configMu.Unlock()
+}
+
+// fireConfigChange invokes the registered config change handler, if any.
+// The handler runs without any internal lock held, so it may safely read the
+// configuration (or call back into Viper) without deadlocking.
+func (v *Viper) fireConfigChange(event fsnotify.Event) {
+	v.hooksMu.RLock()
+	handler := v.onConfigChange
+	v.hooksMu.RUnlock()
+
+	if handler != nil {
+		handler(event)
+	}
 }
 
 // WatchConfig starts watching a config file for changes.
 func WatchConfig() { v.WatchConfig() }
 
 // WatchConfig starts watching a config file for changes.
+//
+// When transactional reload is enabled (see [TransactionalReload]), file
+// changes are applied in isolated transactions: the new configuration is read,
+// merged and validated on a copy, and published atomically only when every
+// step succeeds. Failed reloads leave the last good configuration active and
+// are reported through [Viper.OnConfigReloadError].
 func (v *Viper) WatchConfig() {
 	initWG := sync.WaitGroup{}
 	initWG.Add(1)
@@ -301,14 +368,28 @@ func (v *Viper) WatchConfig() {
 		configDir, _ := filepath.Split(configFile)
 		realConfigFile, _ := filepath.EvalSymlinks(filename)
 
+		// In transactional mode, a coordinator coalesces file events and runs
+		// reloads as isolated transactions. When disabled, the event loop
+		// behaves exactly as it always has.
+		var reloader *txReloader
+		if v.transactionalReload {
+			reloader = newTxReloader(v, configFile)
+			reloader.start()
+		}
+
 		eventsWG := sync.WaitGroup{}
 		eventsWG.Add(1)
 		go func() {
+			defer eventsWG.Done()
+
+			if reloader != nil {
+				defer reloader.stop()
+			}
+
 			for {
 				select {
 				case event, ok := <-watcher.Events:
 					if !ok { // 'Events' channel is closed
-						eventsWG.Done()
 						return
 					}
 					currentConfigFile, _ := filepath.EvalSymlinks(filename)
@@ -319,23 +400,37 @@ func (v *Viper) WatchConfig() {
 						(event.Has(fsnotify.Write) || event.Has(fsnotify.Create))) ||
 						(currentConfigFile != "" && currentConfigFile != realConfigFile) {
 						realConfigFile = currentConfigFile
+
+						if reloader != nil {
+							// Transactional mode: stage, validate and publish the
+							// reload off the event loop; failures leave the last
+							// good configuration in place.
+							reloader.notify(event)
+							continue
+						}
+
 						err := v.ReadInConfig()
 						if err != nil {
 							v.logger.Error(fmt.Sprintf("read config file: %s", err))
 						}
-						if v.onConfigChange != nil {
-							v.onConfigChange(event)
-						}
+						v.fireConfigChange(event)
 					} else if filepath.Clean(event.Name) == configFile && event.Has(fsnotify.Remove) {
-						eventsWG.Done()
-						return
+						if reloader == nil {
+							// Legacy behavior: a removed config file ends the watch.
+							return
+						}
+						// Transactional mode: REMOVE is either one step of an
+						// atomic rename/replace (a CREATE event follows) or a
+						// deletion that may be followed by a recreation. The
+						// directory watch stays valid in both cases, so keep
+						// waiting for the next CREATE/WRITE event instead of
+						// stopping.
 					}
 
 				case err, ok := <-watcher.Errors:
 					if ok { // 'Errors' channel is not closed
 						v.logger.Error(fmt.Sprintf("watcher error: %s", err))
 					}
-					eventsWG.Done()
 					return
 				}
 			}
@@ -1293,11 +1388,12 @@ func (v *Viper) find(lcaseKey string, flagDefault bool) any {
 	}
 
 	// Config file next
-	val = v.searchIndexableWithPathPrefixes(v.config, path)
+	config := v.loadConfig()
+	val = v.searchIndexableWithPathPrefixes(config, path)
 	if val != nil {
 		return val
 	}
-	if nested && v.isPathShadowedInDeepMap(path, v.config) != "" {
+	if nested && v.isPathShadowedInDeepMap(path, config) != "" {
 		return nil
 	}
 
@@ -1608,7 +1704,7 @@ func (v *Viper) ReadInConfig() error {
 		return err
 	}
 
-	v.config = config
+	v.storeConfig(config)
 	return nil
 }
 
@@ -1649,7 +1745,7 @@ func (v *Viper) ReadConfig(in io.Reader) error {
 		return err
 	}
 
-	v.config = config
+	v.storeConfig(config)
 
 	return nil
 }
@@ -1974,7 +2070,7 @@ func (v *Viper) AllKeys() []string {
 	m = v.flattenAndMergeMap(m, v.override, "")
 	m = v.mergeFlatMap(m, castMapFlagToMapInterface(v.pflags))
 	m = v.mergeFlatMap(m, castMapStringSliceToMapInterface(v.env))
-	m = v.flattenAndMergeMap(m, v.config, "")
+	m = v.flattenAndMergeMap(m, v.loadConfig(), "")
 	m = v.flattenAndMergeMap(m, v.kvstore, "")
 	m = v.flattenAndMergeMap(m, v.defaults, "")
 
